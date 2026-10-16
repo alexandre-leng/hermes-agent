@@ -25,9 +25,19 @@ Every request — main turn on any transport, auxiliary calls — goes through
 from __future__ import annotations
 
 import uuid
+from contextvars import ContextVar
 from typing import Any, Optional
 
 OPENCODE_SESSION_HEADER = "x-opencode-session"
+
+# Last real affinity key resolved in THIS context. Auxiliary calls that run outside a
+# conversation (the objective judge in its own thread, a stateless one-shot) resolve no
+# ambient scope, so a fresh random ``oneshot-<hex>`` per call spreads one conversation's
+# requests across different relay backends and throws away its warm prompt cache. Reuse
+# the last key this context actually saw instead. A ContextVar, not a module global: the
+# ambient scope it mirrors is per-context, and concurrent sessions in one process must
+# never inherit each other's key.
+_LAST_SESSION_KEY: ContextVar[str] = ContextVar("opencode_last_session_key", default="")
 
 
 def opencode_transport(provider: Optional[str], model: Optional[str], base_url: Optional[str]) -> tuple[Optional[str], str]:
@@ -102,12 +112,16 @@ def opencode_session_headers(
     if not is_opencode_target(provider, base_url):
         return {}
     key = resolve_affinity_key(session_id)
-    if not key:
-        # Stateless one-shot requests (commit messages, summaries, standalone prompts outside
-        # a session) lack an ambient conversation or session id. OpenCode Go strictly requires
-        # x-opencode-session on every request (HTTP 400 MissingSessionID if absent, #105841)
-        # so generate an ephemeral session id fallback.
-        key = f"oneshot-{uuid.uuid4().hex[:16]}"
+    if key:
+        _LAST_SESSION_KEY.set(key)
+    else:
+        # No ambient conversation or session id resolved (stateless one-shot, auxiliary
+        # call in a foreign thread). OpenCode Go rejects header-less requests with HTTP 400
+        # MissingSessionID (#105841), so a value is mandatory — but it must also stay STABLE
+        # for this context, or consecutive calls of one conversation land on different
+        # backends and lose the warm prompt cache. Reuse this context's last real key; mint
+        # an ephemeral one only when the context has never seen one.
+        key = _LAST_SESSION_KEY.get() or f"oneshot-{uuid.uuid4().hex[:16]}"
     return {OPENCODE_SESSION_HEADER: key}
 
 

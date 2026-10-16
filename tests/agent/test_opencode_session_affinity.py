@@ -161,3 +161,52 @@ def test_stateless_oneshot_still_sends_an_opencode_session_header(out_of_turn):
 
     assert opencode_session_headers("opencode-go", None, session_id=None).get("x-opencode-session")
     assert opencode_session_headers("openrouter", "https://openrouter.ai/api/v1", session_id=None) == {}
+
+
+def test_auxiliary_call_without_ambient_scope_reuses_the_context_key(out_of_turn):
+    """Auxiliary calls that resolve no ambient scope (objective judge in a foreign thread, stateless
+    one-shot) must REUSE the key their context last saw instead of minting a fresh ``oneshot-<hex>``
+    per call: a random key per request pins each call to a different relay backend and discards the
+    conversation's warm prompt cache."""
+    from agent.opencode_affinity import opencode_session_headers
+
+    opencode_session_headers("opencode-go", None, session_id="sess-warm-1")  # context saw a real key
+
+    first = opencode_session_headers("opencode-go", None, session_id=None)["x-opencode-session"]
+    second = opencode_session_headers("opencode-go", None, session_id=None)["x-opencode-session"]
+
+    assert first == second == "sess-warm-1"
+
+
+def test_no_ambient_scope_ever_seen_still_mints_an_ephemeral_key(out_of_turn):
+    """Cold context: no real key was ever resolved, so an ephemeral key is minted (the relay still
+    requires the header) — and it stays stable for that context afterwards."""
+    import contextvars
+
+    from agent.opencode_affinity import opencode_session_headers
+
+    def fresh():
+        return contextvars.Context().run(
+            lambda: opencode_session_headers("opencode-go", None, session_id=None)["x-opencode-session"])
+
+    first = fresh()
+    assert first.startswith("oneshot-")
+
+
+def test_a_context_never_inherits_another_contexts_key(out_of_turn):
+    """The fallback must be per-context, never a process-wide global: two concurrent conversations in
+    one gateway process must not share an affinity key, or their requests would collide on one backend."""
+    import contextvars
+
+    from agent.opencode_affinity import opencode_session_headers
+
+    def resolve(real_key):
+        def body():
+            if real_key:
+                opencode_session_headers("opencode-go", None, session_id=real_key)
+            return opencode_session_headers("opencode-go", None, session_id=None)["x-opencode-session"]
+        return contextvars.Context().run(body)
+
+    assert resolve("sess-chat-a") == "sess-chat-a"
+    # A different context that never saw a key must not pick up chat A's key.
+    assert resolve(None).startswith("oneshot-")
